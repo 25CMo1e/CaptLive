@@ -1,0 +1,525 @@
+import asyncio
+import uuid
+
+import flet as ft
+
+from ...models.recording_model import Recording
+from ...utils.logger import logger
+from ..base_page import PageBase
+from ..components.help_dialog import HelpDialog
+from ..components.recording_dialog import RecordingDialog
+from ..components.search_dialog import SearchDialog
+from app.core.platform_handlers.handlers import DouyinHandler
+
+
+class HomePage(PageBase):
+    def __init__(self, app):
+        super().__init__(app)
+        self.page_name = "home"
+        self.recording_card_area = None
+        self.add_recording_dialog = None
+        self.is_grid_view = False
+        self.douyin_barrage_area = None
+        self.douyin_handler = DouyinHandler()
+        self.douyin_live_id = ""
+        self.app.language_manager.add_observer(self)
+        self.load_language()
+        self.init()
+
+    def load_language(self):
+        language = self.app.language_manager.language
+        for key in ("home_page", "video_quality", "base"):
+            self._.update(language.get(key, {}))
+
+    def init(self):
+        self.recording_card_area = ft.Container(
+            content=ft.Column(controls=[], spacing=10, expand=True),
+            expand=True
+        )
+        self.douyin_barrage_area = ft.Text(value="", selectable=True, expand=True, max_lines=20, color=ft.colors.BLUE)
+        self.douyin_barrage_scroll = ft.ListView(expand=True, spacing=2, auto_scroll=True, height=300)
+        self.douyin_barrage_lines = []
+        self.douyin_id_field = ft.TextField(label="直播间ID", width=200)
+        self.add_recording_dialog = RecordingDialog(self.app, self.add_recording)
+        self.pubsub_subscribe()
+
+    async def load(self):
+        """Load the home page content."""
+        self.content_area.clean()
+        self.content_area.controls.extend([
+            self.create_home_title_area(),
+            self.create_home_content_area()
+        ])
+        self.content_area.update()
+        self.recording_card_area.content.controls.clear()
+        await self.add_record_cards()
+        self.page.on_keyboard_event = self.on_keyboard
+        self.page.on_resized = self.update_grid_layout
+
+    def pubsub_subscribe(self):
+        self.app.page.pubsub.subscribe_topic('add', self.subscribe_add_cards)
+        self.app.page.pubsub.subscribe_topic('delete_all', self.subscribe_del_all_cards)
+
+    async def toggle_view_mode(self, _):
+        self.is_grid_view = not self.is_grid_view
+        current_content = self.recording_card_area.content
+        current_controls = current_content.controls if hasattr(current_content, 'controls') else []
+
+        column_width = 350
+        runs_count = max(1, int(self.page.width / column_width))
+
+        if self.is_grid_view:
+            new_content = ft.GridView(
+                expand=True,
+                runs_count=runs_count,
+                spacing=10,
+                run_spacing=10,
+                child_aspect_ratio=2.3,
+                controls=current_controls
+            )
+        else:
+            new_content = ft.Column(
+                controls=current_controls,
+                spacing=10,
+                expand=True
+            )
+
+        self.recording_card_area.content = new_content
+        self.content_area.clean()
+        self.content_area.controls.extend([self.create_home_title_area(), self.create_home_content_area()])
+        self.content_area.update()
+
+    def create_home_title_area(self):
+        return ft.Row(
+            [
+                ft.Text(self._["recording_list"], theme_style=ft.TextThemeStyle.TITLE_MEDIUM),
+                ft.Container(expand=True),
+                ft.IconButton(
+                    icon=ft.Icons.GRID_VIEW if self.is_grid_view else ft.Icons.LIST,
+                    tooltip=self._["toggle_view"],
+                    on_click=self.toggle_view_mode
+                ),
+                ft.IconButton(icon=ft.Icons.SEARCH, tooltip=self._["search"], on_click=self.search_on_click),
+                ft.IconButton(icon=ft.Icons.ADD, tooltip=self._["add_record"], on_click=self.add_recording_on_click),
+                ft.IconButton(icon=ft.Icons.REFRESH, tooltip=self._["refresh"], on_click=self.refresh_cards_on_click),
+                ft.IconButton(
+                    icon=ft.Icons.PLAY_ARROW,
+                    tooltip=self._["batch_start"],
+                    on_click=self.start_monitor_recordings_on_click,
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.STOP, tooltip=self._["batch_stop"], on_click=self.stop_monitor_recordings_on_click
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.DELETE_SWEEP,
+                    tooltip=self._["batch_delete"],
+                    on_click=self.delete_monitor_recordings_on_click,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.START,
+        )
+
+    async def reset_cards_visibility(self):
+        cards_obj = self.app.record_card_manager.cards_obj
+        for card_info in cards_obj.values():
+            if not card_info["card"].visible:
+                card_info["card"].visible = True
+                card_info["card"].update()
+
+    async def filter_recordings(self, query):
+        recordings = self.app.record_manager.recordings
+        cards_obj = self.app.record_card_manager.cards_obj
+
+        if not query.strip():
+            await self.reset_cards_visibility()
+            return {}
+        else:
+            lower_query = query.strip().lower()
+            new_ids = {
+                rec.rec_id
+                for rec in recordings
+                if lower_query in str(rec.to_dict()).lower() or lower_query in rec.display_title
+            }
+
+            for card_info in cards_obj.values():
+                card_info["card"].visible = card_info["card"].key in new_ids
+                card_info["card"].update()
+
+            if not new_ids:
+                await self.app.snack_bar.show_snack_bar(self._["not_search_result"], duration=2000)
+            return new_ids
+
+    def create_home_content_area(self):
+        # 确保 controls 列表不包含 None
+        controls = [
+            ft.Divider(height=1),
+            self.recording_card_area if self.recording_card_area else ft.Container(),
+            ft.Row([
+                ft.Text("抖音弹幕区", style=ft.TextThemeStyle.TITLE_SMALL),
+                self.douyin_id_field,
+                ft.ElevatedButton("启动弹幕", on_click=self.on_start_barrage_click),
+                ft.ElevatedButton("停止弹幕", on_click=self.stop_douyin_barrage),
+                ft.ElevatedButton("导出弹幕", on_click=self.export_douyin_barrage),
+                ft.ElevatedButton("清空弹幕", on_click=self.clear_douyin_barrage),
+            ]),
+            self.douyin_barrage_scroll if self.douyin_barrage_scroll else ft.ListView(),
+        ]
+        return ft.Column(
+            expand=True,
+            controls=controls
+        )
+
+    def append_barrage_line(self, msg, color=None):
+        if color is None:
+            color = ft.colors.BLUE
+        self.douyin_barrage_lines.append(msg)
+        self.douyin_barrage_scroll.controls.append(ft.Text(msg, color=color))
+        self.douyin_barrage_scroll.update()
+
+    def handle_douyin_error(self, msg):
+        self.append_barrage_line(msg, color=ft.colors.RED)
+
+    def on_start_barrage_click(self, e=None):
+        live_id = self.douyin_id_field.value.strip()
+        if not live_id:
+            self.append_barrage_line("请先输入直播间ID", color=ft.colors.RED)
+            return
+        self.douyin_barrage_lines.clear()
+        self.douyin_barrage_scroll.controls.clear()
+        self.douyin_barrage_scroll.update()
+        self.douyin_handler.start_barrage(
+            live_id,
+            on_chat=self.handle_douyin_chat,
+            on_gift=self.handle_douyin_gift,
+            on_member=self.handle_douyin_member,
+            on_like=self.handle_douyin_like,
+            on_social=self.handle_douyin_social,
+            on_emoji_chat=self.handle_douyin_emoji_chat,
+            on_room_user_seq=self.handle_douyin_room_user_seq,
+            on_room_stats=self.handle_douyin_room_stats,
+            on_control=self.handle_douyin_control,
+            on_error=self.handle_douyin_error
+        )
+
+    def clear_douyin_barrage(self, _):
+        self.douyin_barrage_lines.clear()
+        self.douyin_barrage_scroll.controls.clear()
+        self.douyin_barrage_scroll.update()
+
+    def export_douyin_barrage(self, _):
+        if not self.douyin_barrage_lines:
+            return
+        import datetime
+        filename = f"douyin_barrage_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.douyin_barrage_lines))
+        self.append_barrage_line(f"[系统] 已导出到 {filename}")
+
+    def start_douyin_barrage(self, _):
+        if not self.douyin_live_id:
+            self.append_barrage_line("请先输入直播间ID")
+            return
+        def on_chat(msg):
+            line = f"[弹幕]{msg.user.nick_name}: {msg.content}"
+            self.append_barrage_line(line)
+        def on_gift(msg):
+            line = f"[礼物]{msg.user.nick_name} 送出 {msg.gift.name}x{msg.combo_count}"
+            self.append_barrage_line(line)
+        self.clear_douyin_barrage(None)
+        self.append_barrage_line("正在连接...")
+        self.douyin_handler.start_barrage(self.douyin_live_id, on_chat=on_chat, on_gift=on_gift)
+
+    def stop_douyin_barrage(self, _):
+        self.douyin_handler.stop_barrage()
+        self.append_barrage_line("已停止弹幕抓取")
+
+    async def add_record_cards(self):
+
+        cards_to_create = []
+        existing_cards = []
+        
+        for recording in self.app.record_manager.recordings:
+            if recording.rec_id not in self.app.record_card_manager.cards_obj:
+                cards_to_create.append(recording)
+            else:
+                existing_card = self.app.record_card_manager.cards_obj[recording.rec_id]["card"]
+                existing_card.visible = True
+                existing_cards.append(existing_card)
+        
+        async def create_card_with_time_range(_recording: Recording):
+            _card = await self.app.record_card_manager.create_card(_recording)
+            _recording.scheduled_time_range = await self.app.record_manager.get_scheduled_time_range(
+                _recording.scheduled_start_time, _recording.monitor_hours
+            )
+            return _card, _recording
+        
+        if cards_to_create:
+            results = await asyncio.gather(*[
+                create_card_with_time_range(recording)
+                for recording in cards_to_create
+            ])
+            
+            for card, recording in results:
+                self.recording_card_area.content.controls.append(card)
+                self.app.record_card_manager.cards_obj[recording.rec_id]["card"] = card
+        
+        if existing_cards:
+            self.recording_card_area.content.controls.extend(existing_cards)
+        
+        self.recording_card_area.update()
+        
+        if not self.app.record_manager.periodic_task_started:
+            self.page.run_task(
+                self.app.record_manager.setup_periodic_live_check,
+                self.app.record_manager.loop_time_seconds
+            )
+
+    async def show_all_cards(self):
+        cards_obj = self.app.record_card_manager.cards_obj
+        for card in cards_obj.values():
+            card["card"].visible = True
+        self.recording_card_area.update()
+
+    async def add_recording(self, recordings_info):
+        user_config = self.app.settings.user_config
+        logger.info(f"Add items: {len(recordings_info)}")
+        
+        new_recordings = []
+        for recording_info in recordings_info:
+            if recording_info.get("record_format"):
+                recording = Recording(
+                    rec_id=str(uuid.uuid4()),
+                    url=recording_info["url"],
+                    streamer_name=recording_info["streamer_name"],
+                    quality=recording_info["quality"],
+                    record_format=recording_info["record_format"],
+                    segment_record=recording_info["segment_record"],
+                    segment_time=recording_info["segment_time"],
+                    monitor_status=recording_info["monitor_status"],
+                    scheduled_recording=recording_info["scheduled_recording"],
+                    scheduled_start_time=recording_info["scheduled_start_time"],
+                    monitor_hours=recording_info["monitor_hours"],
+                    recording_dir=recording_info["recording_dir"],
+                    enabled_message_push=recording_info["enabled_message_push"],
+                    enabled_barrage_recording=recording_info.get("enabled_barrage_recording", user_config.get("enable_barrage_recording", False))
+                )
+            else:
+                recording = Recording(
+                    rec_id=str(uuid.uuid4()),
+                    url=recording_info["url"],
+                    streamer_name=recording_info["streamer_name"],
+                    quality=recording_info["quality"],
+                    record_format=user_config.get("video_format", "TS"),
+                    segment_record=user_config.get("segmented_recording_enabled", False),
+                    segment_time=user_config.get("video_segment_time", "1800"),
+                    monitor_status=True,
+                    scheduled_recording=user_config.get("scheduled_recording", False),
+                    scheduled_start_time=user_config.get("scheduled_start_time"),
+                    monitor_hours=user_config.get("monitor_hours"),
+                    recording_dir=None,
+                    enabled_message_push=recording_info.get("enabled_message_push", False),
+                    enabled_barrage_recording=recording_info.get("enabled_barrage_recording", user_config.get("enable_barrage_recording", False))
+                )
+
+            recording.loop_time_seconds = int(user_config.get("loop_time_seconds", 300))
+            recording.update_title(self._[recording.quality])
+            await self.app.record_manager.add_recording(recording)
+            new_recordings.append(recording)
+
+        if new_recordings:
+            async def create_card_with_time_range(rec):
+                _card = await self.app.record_card_manager.create_card(rec)
+                rec.scheduled_time_range = await self.app.record_manager.get_scheduled_time_range(
+                    rec.scheduled_start_time, rec.monitor_hours
+                )
+                return _card, rec
+
+            results = await asyncio.gather(*[
+                create_card_with_time_range(rec)
+                for rec in new_recordings
+            ])
+
+            for card, recording in results:
+                self.recording_card_area.content.controls.append(card)
+                self.app.record_card_manager.cards_obj[recording.rec_id]["card"] = card
+                self.app.page.pubsub.send_others_on_topic("add", recording)
+            
+            self.recording_card_area.update()
+
+        await self.app.snack_bar.show_snack_bar(self._["add_recording_success_tip"], bgcolor=ft.Colors.GREEN)
+
+    async def search_on_click(self, _e):
+        """Open the search dialog when the search button is clicked."""
+        search_dialog = SearchDialog(home_page=self)
+        search_dialog.open = True
+        self.app.dialog_area.content = search_dialog
+        self.app.dialog_area.update()
+
+    async def add_recording_on_click(self, _e):
+        await self.add_recording_dialog.show_dialog()
+
+    async def refresh_cards_on_click(self, _e):
+        cards_obj = self.app.record_card_manager.cards_obj
+        recordings = self.app.record_manager.recordings
+        selected_cards = self.app.record_card_manager.selected_cards
+        new_ids = {rec.rec_id for rec in recordings}
+        to_remove = []
+        for card_id, card in cards_obj.items():
+            if card_id not in new_ids:
+                to_remove.append(card)
+                continue
+            if card_id in selected_cards:
+                selected_cards[card_id].selected = False
+                card["card"].content.bgcolor = None
+                card["card"].update()
+
+        for card in to_remove:
+            card_key = card["card"].key
+            cards_obj.pop(card_key, None)
+            self.recording_card_area.controls.remove(card["card"])
+        await self.show_all_cards()
+        await self.app.snack_bar.show_snack_bar(self._["refresh_success_tip"], bgcolor=ft.Colors.GREEN)
+
+    async def start_monitor_recordings_on_click(self, _):
+        await self.app.record_manager.check_free_space()
+        if self.app.recording_enabled:
+            await self.app.record_manager.start_monitor_recordings()
+            await self.app.snack_bar.show_snack_bar(self._["start_recording_success_tip"], bgcolor=ft.Colors.GREEN)
+
+    async def stop_monitor_recordings_on_click(self, _):
+        await self.app.record_manager.stop_monitor_recordings()
+        await self.app.snack_bar.show_snack_bar(self._["stop_recording_success_tip"])
+
+    async def delete_monitor_recordings_on_click(self, _):
+        selected_recordings = await self.app.record_manager.get_selected_recordings()
+        tips = self._["batch_delete_confirm_tip"] if selected_recordings else self._["clear_all_confirm_tip"]
+
+        async def confirm_dlg(_):
+
+            if selected_recordings:
+                await self.app.record_manager.stop_monitor_recordings(selected_recordings)
+                await self.app.record_manager.delete_recording_cards(selected_recordings)
+            else:
+                await self.app.record_manager.stop_monitor_recordings(self.app.record_manager.recordings)
+                await self.app.record_manager.clear_all_recordings()
+                await self.delete_all_recording_cards()
+                self.app.page.pubsub.send_others_on_topic("delete_all", None)
+
+            self.recording_card_area.update()
+            await self.app.snack_bar.show_snack_bar(
+                self._["delete_recording_success_tip"], bgcolor=ft.Colors.GREEN, duration=2000
+            )
+            await close_dialog(None)
+
+        async def close_dialog(_):
+            batch_delete_alert_dialog.open = False
+            batch_delete_alert_dialog.update()
+
+        batch_delete_alert_dialog = ft.AlertDialog(
+            title=ft.Text(self._["confirm"]),
+            content=ft.Text(tips),
+            actions=[
+                ft.TextButton(text=self._["cancel"], on_click=close_dialog),
+                ft.TextButton(text=self._["sure"], on_click=confirm_dlg),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            modal=False,
+        )
+
+        batch_delete_alert_dialog.open = True
+        self.app.dialog_area.content = batch_delete_alert_dialog
+        self.page.update()
+
+    async def delete_all_recording_cards(self):
+        self.recording_card_area.content.controls.clear()
+        self.recording_card_area.update()
+        self.app.record_card_manager.cards_obj = {}
+
+    async def subscribe_del_all_cards(self, *_):
+        await self.delete_all_recording_cards()
+
+    async def subscribe_add_cards(self, _, recording: Recording):
+        """Handle the subscription of adding cards from other clients"""
+        if recording.rec_id not in self.app.record_card_manager.cards_obj:
+            card = await self.app.record_card_manager.create_card(recording)
+            recording.scheduled_time_range = await self.app.record_manager.get_scheduled_time_range(
+                recording.scheduled_start_time, recording.monitor_hours
+            )
+            
+            self.recording_card_area.content.controls.append(card)
+            self.app.record_card_manager.cards_obj[recording.rec_id]["card"] = card
+            self.recording_card_area.update()
+
+    async def update_grid_layout(self, _):
+        self.page.run_task(self.recalculate_grid_columns)
+
+    async def recalculate_grid_columns(self):
+        if not self.is_grid_view:
+            return
+
+        column_width = 350
+        runs_count = max(1, int(self.page.width / column_width))
+
+        if isinstance(self.recording_card_area.content, ft.GridView):
+            grid_view = self.recording_card_area.content
+            grid_view.runs_count = runs_count
+            grid_view.update()
+
+    async def on_keyboard(self, e: ft.KeyboardEvent):
+        if e.alt and e.key == "H":
+            self.app.dialog_area.content = HelpDialog(self.app)
+            self.app.dialog_area.content.open = True
+            self.app.dialog_area.update()
+        if self.app.current_page == self:
+            if e.ctrl and e.key == "F":
+                self.page.run_task(self.search_on_click, e)
+            elif e.ctrl and e.key == "R":
+                self.page.run_task(self.refresh_cards_on_click, e)
+            elif e.alt and e.key == "N":
+                self.page.run_task(self.add_recording_on_click, e)
+            elif e.alt and e.key == "B":
+                self.page.run_task(self.start_monitor_recordings_on_click, e)
+            elif e.alt and e.key == "P":
+                self.page.run_task(self.stop_monitor_recordings_on_click, e)
+            elif e.alt and e.key == "D":
+                self.page.run_task(self.delete_monitor_recordings_on_click, e)
+
+    def on_douyin_id_submit(self, e):
+        self.douyin_live_id = e.control.value or ""
+
+    def handle_douyin_chat(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_gift(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_member(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_like(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_social(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_emoji_chat(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_room_user_seq(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_room_stats(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+
+    def handle_douyin_control(self, msg):
+        # 弹幕录制功能只保存到文件，不在UI中显示
+        pass
+ 
