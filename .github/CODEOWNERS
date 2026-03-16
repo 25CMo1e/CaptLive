@@ -1,0 +1,24 @@
+# CODEOWNERS 文件
+# 用于指定代码的所有者和审查者
+# GitHub会自动在PR中@这些用户
+
+# StreamCap 相关文件
+/app/app_manager.py @ihmily
+/app/core/ @ihmily
+/app/ui/ @ihmily
+/main.py @ihmily
+*.py @ihmily
+
+# DouyinLiveWebFetcher 相关文件
+/app/douyin_fetcher/ @saermart
+/app/douyin_fetcher/liveMan.py @saermart
+/app/douyin_fetcher/sign.js @saermart
+/app/douyin_fetcher/protobuf/ @saermart
+
+# 合并后的新文件
+/app/douyin_fetcher/streamcap_adapter.py
+
+# 文档文件
+/ATTRIBUTION.md
+/CODE_COMPARISON_REPORT.md
+/FINAL_CODE_ATTRIBUTION.md
