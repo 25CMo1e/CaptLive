@@ -1,6 +1,6 @@
 # CaptLive
 
-基于 StreamCap 和 DouyinLiveWebFetcher 合并开发的直播录制工具。
+基于 StreamCap 和 DouyinLiveWebFetcher 合并开发的直播录制工具，可一键抓取直播间弹幕，视频，下单信息。自动检测开播并进行录制。
 
 ## 📋 项目说明
 
